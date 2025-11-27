@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import logging
+import time
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.positioning.motion_commander import MotionCommander
+from cflib.utils import uri_helper
+from cflib.utils.multiranger import Multiranger
+from cflib.crazyflie.log import LogConfig
+
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7AA')
+
+logging.basicConfig(level=logging.ERROR)
+
+def is_close(d, threshold=0.2):
+    return d is not None and d < threshold
+
+if __name__ == "__main__":
+    cflib.crtp.init_drivers()
+
+    cf = Crazyflie(rw_cache='./cache')
+    print(f"Intentando conectar al Crazyflie en {URI}...")
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        print(f"Conectado al Crazyflie en {URI}")
+
+        # --- Log posición ---
+        log_conf = LogConfig(name='pos', period_in_ms=50)
+        log_conf.add_variable('stateEstimate.x', 'float')
+        log_conf.add_variable('stateEstimate.y', 'float')
+        log_conf.add_variable('stateEstimate.z', 'float')
+
+        pos = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+        def cb(ts, data, logconf):
+            pos["x"] = data["stateEstimate.x"]
+            pos["y"] = data["stateEstimate.y"]
+            pos["z"] = data["stateEstimate.z"]
+
+        scf.cf.log.add_config(log_conf)
+        log_conf.data_received_cb.add_callback(cb)
+        log_conf.start()
+
+        # --- Abrir archivo para log de distancias ---
+        log_file = open("distancias_obstaculos.txt", "w")
+        log_file.write("tiempo\tfront\tback\tleft\tright\tup\tvx\tvy\tvz\n")
+        start_time = time.time()
+
+        TARGET_ALT = 0.5
+        TARGET_DIST = 5.0
+        VELOCITY = 0.5  # velocidad fija
+        vx_base = VELOCITY  # velocidad en X
+
+        with MotionCommander(scf, default_height=0.3) as mc:
+            with Multiranger(scf) as mr:
+
+                # --- Despegue suave ---
+                print("Despegue manual...")
+                while pos["z"] < TARGET_ALT - 0.05:
+                    mc.start_linear_motion(0, 0, 0.15)
+                    time.sleep(0.1)
+                mc.stop()
+                print(f"Altura estabilizada en {pos['z']:.2f} m")
+
+                x0 = pos["x"]
+                keep_flying = True
+
+                while keep_flying:
+                    vx = vx_base  # velocidad hacia X
+                    vy = 0.0
+                    vz = 0.0
+
+                    # --- Mantener altura ---
+                    errz = TARGET_ALT - pos["z"]
+                    vz = max(min(errz * 0.5, 0.15), -0.15)
+
+                    # --- Obstáculo frontal --- Atento a esto No FRENA, COMPROBAR
+                    if is_close(mr.front):
+                        print("Objeto delante detectado")
+                        vx -= VELOCITY  # detener avance momentáneamente
+                        if not is_close(mr.right):
+                            vy -= VELOCITY
+                            print("Moviéndose a la derecha para esquivar")
+                        elif not is_close(mr.left):
+                            vy += VELOCITY
+                            print("Moviéndose a la izquierda para esquivar")
+                        else:
+                            vy = 0.0
+                            print("Sin espacio lateral → esperando")
+
+                    # --- Obstáculo lateral  ---
+                    if is_close(mr.left):
+                        vy -= VELOCITY
+                        print("Objeto a la izquierda muy cerca → corrigiendo a la derecha")
+                    if is_close(mr.right):
+                        vy += VELOCITY
+                        print("Objeto a la derecha muy cerca → corrigiendo a la izquierda")
+
+                    # --- Obstáculo arriba → terminar demo ---
+                    if is_close(mr.up):
+                        print("Objeto arriba detectado → terminando demo")
+                        keep_flying = False
+
+                    # --- Comprobar distancia objetivo ---
+                    dis = pos["x"] - x0
+                    print(f"Distancia recorrida: {dis:.2f} m")    
+
+                    if dis >= TARGET_DIST:
+                        print("Distancia objetivo alcanzada")
+                        keep_flying = False
+
+                    # --- Guardar log ---
+                    t = time.time() - start_time
+                    log_file.write(f"{t:.2f}\t{mr.front}\t{mr.back}\t{mr.left}\t{mr.right}\t{mr.up}\t{vx:.2f}\t{vy:.2f}\t{vz:.2f}\n")
+
+                    mc.start_linear_motion(vx, vy, vz)
+                    time.sleep(0.1)
+
+                # --- Aterrizaje final ---
+                print("Aterrizando...")
+                while pos["z"] > 0.15:
+                    mc.start_linear_motion(0, 0, -0.25)
+                    time.sleep(0.1)
+                mc.stop()
+                print("Demo terminada.")
+
+        # --- Cerrar archivo de log ---
+        log_file.close()
+        log_conf.stop()

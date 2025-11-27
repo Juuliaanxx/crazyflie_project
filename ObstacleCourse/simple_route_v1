@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import logging
+import sys
+import time
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.positioning.motion_commander import MotionCommander
+from cflib.utils import uri_helper
+from cflib.utils.multiranger import Multiranger
+from cflib.crazyflie.log import LogConfig
+
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7AA')
+
+logging.basicConfig(level=logging.ERROR)
+
+
+def is_close(d):
+    return d is not None and d < 0.25
+
+
+if __name__ == "__main__":
+    cflib.crtp.init_drivers()
+
+    cf = Crazyflie(rw_cache='./cache')
+    with SyncCrazyflie(URI, cf=cf) as scf:
+
+        # -----------------------------
+        # LOG Flowdeck
+        # -----------------------------
+        log_conf = LogConfig(name='pos', period_in_ms=50)
+        log_conf.add_variable('stateEstimate.x', 'float')
+        log_conf.add_variable('stateEstimate.y', 'float')
+        log_conf.add_variable('stateEstimate.z', 'float')
+
+        pos = {"x": 0, "y": 0, "z": 0}
+
+        def cb(ts, data, logconf):
+            pos["x"] = data["stateEstimate.x"]
+            pos["y"] = data["stateEstimate.y"]
+            pos["z"] = data["stateEstimate.z"]
+
+        scf.cf.log.add_config(log_conf)
+        log_conf.data_received_cb.add_callback(cb)
+        log_conf.start()
+
+        TARGET_ALT = 1.0
+        TARGET_DIST = 5.0
+
+        with MotionCommander(scf, default_height=0.3) as mc:
+            with Multiranger(scf) as mr:
+
+                # -----------------------------
+                # MANUAL TAKEOFF (sin take_off)
+                # -----------------------------
+                print("Iniciando despegue manual…")
+                for i in range(15):
+                    mc.start_linear_motion(0, 0, 0.3)  # subir suave
+                    time.sleep(0.1)
+
+                # -----------------------------
+                # SUBIR A 1 METRO
+                # -----------------------------
+                print("Subiendo a 1 metro…")
+                while pos["z"] < TARGET_ALT - 0.05:
+                    mc.start_linear_motion(0, 0, 0.3)
+                    time.sleep(0.1)
+
+                mc.stop()
+                print(f"Altura estabilizada en {pos['z']:.2f} m")
+
+                # Guardar origen
+                x0 = pos["x"]
+
+                keep = True
+
+                # -----------------------------
+                # AVANCE + EVITACIÓN OBSTÁCULOS
+                # -----------------------------
+                while keep:
+                    d = pos["x"] - x0
+                    print(f"Distancia recorrida: {d:.2f} m")
+
+                    if d >= TARGET_DIST:
+                        print("Meta alcanzada.")
+                        break
+
+                    vx = 0.4
+                    vy = 0.0
+                    vz = 0.0
+
+                    # Evitación
+                    if is_close(mr.front):
+                        vx = -0.3
+                    if is_close(mr.back):
+                        vx = 0.3
+                    if is_close(mr.left):
+                        vy = -0.3
+                    if is_close(mr.right):
+                        vy = 0.3
+                    if is_close(mr.up):
+                        print("Objeto encima → abortando.")
+                        keep = False
+                        break
+
+                    # Mantener altura
+                    errz = TARGET_ALT - pos["z"]
+                    vz = max(min(errz * 0.6, 0.25), -0.25)
+
+                    mc.start_linear_motion(vx, vy, vz)
+                    time.sleep(0.1)
+
+                # -----------------------------
+                # MANUAL LANDING (sin land())
+                # -----------------------------
+                print("Aterrizando…")
+                while pos["z"] > 0.15:
+                    mc.start_linear_motion(0, 0, -0.25)
+                    time.sleep(0.1)
+
+                mc.stop()
+                print("Aterrizado.")
+
+        log_conf.stop()

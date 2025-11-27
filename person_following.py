@@ -1,2 +1,0 @@
-# Seguimiento de personas
-
