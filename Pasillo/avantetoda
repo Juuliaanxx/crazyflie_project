@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+#     ||          ____  _ __
+#  +------+      / __ )(_) /_______________ _____  ___
+#  | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
+#  +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
+#   ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
+#
+#  Copyright (C) 2017 Bitcraze AB
+#
+#  Crazyflie Python Library
+#
+#  This program is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License
+#  as published by the Free Software Foundation; either version 2
+#  of the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+"""
+Script modificado para mantener al Crazyflie centrado en un pasillo,
+usando Flow y Multi-ranger decks. Evita obstáculos adelante/atrás
+y centra lateralmente según la distancia izquierda/derecha.
+"""
 
 import logging
 import sys
@@ -11,147 +38,65 @@ from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.positioning.motion_commander import MotionCommander
 from cflib.utils import uri_helper
 from cflib.utils.multiranger import Multiranger
-from cflib.crazyflie.log import LogConfig
 
 URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7AA')
 
+if len(sys.argv) > 1:
+    URI = sys.argv[1]
+
+# Solo mostrar errores
 logging.basicConfig(level=logging.ERROR)
 
-def is_close(d):
-    return d is not None and d < 0.25
 
-if __name__ == "__main__":
+def is_close(range):
+    MIN_DISTANCE = 0.2  # m
+    if range is None:
+        return False
+    else:
+        return range < MIN_DISTANCE
+
+
+if __name__ == '__main__':
     cflib.crtp.init_drivers()
 
     cf = Crazyflie(rw_cache='./cache')
     with SyncCrazyflie(URI, cf=cf) as scf:
+        scf.cf.platform.send_arming_request(True)
+        time.sleep(1.0)
 
-        # -----------------------------
-        # LOG Flowdeck
-        # -----------------------------
-        log_conf = LogConfig(name='pos', period_in_ms=50)
-        log_conf.add_variable('stateEstimate.x', 'float')
-        log_conf.add_variable('stateEstimate.y', 'float')
-        log_conf.add_variable('stateEstimate.z', 'float')
+        with MotionCommander(scf) as motion_commander:
+            with Multiranger(scf) as multiranger:
+                keep_flying = True
 
-        pos = {"x": 0, "y": 0, "z": 0}
+                while keep_flying:
+                    VELOCITY = 0.5
+                    KP = 1.0  # ganancia proporcional (ajustar según comportamiento)
+                    velocity_x = 0.0
+                    velocity_y = 0.0
 
-        def cb(ts, data, logconf):
-            pos["x"] = data["stateEstimate.x"]
-            pos["y"] = data["stateEstimate.y"]
-            pos["z"] = data["stateEstimate.z"]
+                    # Centrarse en el pasillo usando control proporcional
+                    # error = left - right. Si error>0 => mover izquierda (velocity_y negativo)
+                    if multiranger.left is not None and multiranger.right is not None:
+                        error = multiranger.left - multiranger.right
+                        # deadband pequeña para evitar oscilar por ruido (1 cm)
+                        if abs(error) > 0.01:
+                            # proporcional: invertir signo para que error>0 -> mover izquierda
+                            velocity_y = -KP * error
+                            # limitar velocidad máxima a `VELOCITY` por seguridad
+                            if velocity_y > VELOCITY:
+                                velocity_y = VELOCITY
+                            elif velocity_y < -VELOCITY:
+                                velocity_y = -VELOCITY
 
-        scf.cf.log.add_config(log_conf)
-        log_conf.data_received_cb.add_callback(cb)
-        log_conf.start()
+                    # Comprobar sensor superior (mano encima)
+                    if is_close(multiranger.up):
+                        print('Hand detected above, stopping demo')
+                        keep_flying = False
 
-        TARGET_ALT = 1.0
-        TARGET_DIST = 5.0
+                    motion_commander.start_linear_motion(
+                        velocity_x, velocity_y, 0
+                    )
 
-        with MotionCommander(scf, default_height=0.3) as mc:
-            with Multiranger(scf) as mr:
-
-                # -----------------------------
-                # MANUAL TAKEOFF (suave)
-                # -----------------------------
-                print("Iniciando despegue manual…")
-                for _ in range(15):
-                    mc.start_linear_motion(0, 0, 0.3)
                     time.sleep(0.1)
 
-                # -----------------------------
-                # SUBIR A 1 METRO
-                # -----------------------------
-                print("Subiendo a 1 metro…")
-                while pos["z"] < TARGET_ALT - 0.05:
-                    mc.start_linear_motion(0, 0, 0.3)
-                    time.sleep(0.1)
-
-                mc.stop()
-                print(f"Altura estabilizada en {pos['z']:.2f} m")
-
-                # Guardar origen
-                x0 = pos["x"]
-
-                keep = True
-                escaping = False
-                lateral_dir = 0  # +1 izquierda, -1 derecha
-
-                # -----------------------------
-                # AVANCE + EVITACIÓN OBSTÁCULOS
-                # -----------------------------
-                while keep:
-                    d = pos["x"] - x0
-                    print(f"Distancia recorrida: {d:.2f} m")
-
-                    if d >= TARGET_DIST:
-                        print("Meta alcanzada.")
-                        break
-
-                    # Velocidades
-                    vx = 0.4
-                    vy = 0.0
-                    vz = 0.0
-
-                    # -----------------------------
-                    # Evitación frontal con escape lateral
-                    # -----------------------------
-                    if is_close(mr.front):
-                        print("Obstáculo frontal detectado → evaluando escape lateral")
-                        vx = 0.0  # detiene avance frontal
-                        escaping = True
-
-                        # Elegir lado con más espacio
-                        left_dist = mr.left if mr.left is not None else 1.0
-                        right_dist = mr.right if mr.right is not None else 1.0
-
-                        if left_dist > right_dist:
-                            lateral_dir = 1   # izquierda
-                        else:
-                            lateral_dir = -1  # derecha
-
-                    # Ejecutar movimiento lateral mientras se está escapando
-                    if escaping:
-                        vy = 0.3 * lateral_dir
-
-                        # Comprobar si obstáculo frontal desapareció
-                        if not is_close(mr.front):
-                            print("Frente despejado → reanudando avance")
-                            escaping = False
-                            vy = 0.0
-                            lateral_dir = 0
-
-                    # Evitación lateral adicional mientras avanza
-                    if not escaping:
-                        if is_close(mr.left):
-                            vy = -0.3  # alejarse de izquierda → moverse a la derecha
-                        if is_close(mr.right):
-                            vy = 0.3   # alejarse de derecha → moverse a la izquierda
-
-                    # Evitación vertical
-                    if is_close(mr.up):
-                        print("Objeto encima → abortando.")
-                        keep = False
-                        break
-#                    elif is_close(mr.down):
-#                        vz = 0.2  # elevar ligeramente
-
-                    # Mantener altura objetivo
-                    errz = TARGET_ALT - pos["z"]
-                    vz += max(min(errz * 0.6, 0.25), -0.25)
-
-                    mc.start_linear_motion(vx, vy, vz)
-                    time.sleep(0.1)
-
-                # -----------------------------
-                # MANUAL LANDING (suave)
-                # -----------------------------
-                print("Aterrizando…")
-                while pos["z"] > 0.15:
-                    mc.start_linear_motion(0, 0, -0.25)
-                    time.sleep(0.1)
-
-                mc.stop()
-                print("Aterrizado.")
-
-        log_conf.stop()
+            print('Demo terminated!')
