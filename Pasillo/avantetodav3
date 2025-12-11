@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+#     ||          ____  _ __
+#  +------+      / __ )(_) /_______________ _____  ___
+#  | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
+#  +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
+#   ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
+#
+#  Copyright (C) 2017 Bitcraze AB
+#
+#  Crazyflie Python Library
+#
+#  This program is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License
+#  as published by the Free Software Foundation; either version 2
+#  of the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+"""
+Script modificado para mantener al Crazyflie centrado en un pasillo,
+usando Flow y Multi-ranger decks. Evita obstáculos adelante/atrás
+y centra lateralmente según la distancia izquierda/derecha.
+"""
+
+import logging
+import sys
+import time
+import math
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.positioning.motion_commander import MotionCommander
+from cflib.utils import uri_helper
+from cflib.utils.multiranger import Multiranger
+from cflib.crazyflie.log import LogConfig
+
+# === Configuración (ajusta estos parámetros según pruebas) ===
+KP = 0.3               # ganancia proporcional lateral
+KD = 0.2               # ganancia derivativa lateral
+ALPHA = 0.6            # factor de suavizado (0-1)
+MIN_LAT_SPEED = 0.03   # velocidad lateral mínima para vencer inercias (m/s)
+MAX_LAT_VELOCITY = 0.5 # velocidad lateral máxima (m/s)
+VELOCITY_X_CRUISE = 0.1  # velocidad hacia delante por defecto (m/s)
+TARGET_DISTANCE_X = 10.0  # distancia objetivo en X (m)
+LOG_PERIOD_MS = 50     # periodo del LogConfig (ms)
+# Parámetros para detección de saltos y comportamiento conservador
+JUMP_ERROR_THRESHOLD = 0.5      # cambio en error que consideramos "drástico" (m)
+JUMP_MEASURE_THRESHOLD = 0.5    # cambio en alguna medida (left/right) que indica apertura (m)
+JUMP_IGNORE_TIME = 1.0          # tiempo (s) para mantener comportamiento conservador después de un salto
+KP_JUMP_SCALE = 0.2             # escala de KP durante el periodo de salto
+SLOW_VX_IN_JUMP = 0.02          # velocidad hacia delante durante el periodo de salto (m/s)
+MIN_DISTANCE_OBSTACLE = 0.2     # distancia mínima a obstáculos (m)
+DERIVATIVE_FILTER_ALPHA = 0.6  # suavizado para la derivada del error (0-1)
+MAX_LAT_ACCEL = 1.0            # aceleración máxima lateral del setpoint (m/s^2)
+# ==========================================================
+# Modo amortiguado (más lento, menos sobreoscilación)
+DAMPED_MODE = True
+DAMPED_KP_SCALE = 0.6
+DAMPED_KD_SCALE = 2.0
+DAMPED_DERIV_ALPHA = 0.85
+DAMPED_MAX_LAT_ACCEL = 0.5
+
+# === Parámetros de control de posición (mantener distancia de las paredes) ===
+POSITION_MAINTENANCE = True      # activar/desactivar mantenimiento de posición
+MIN_SAFE_DISTANCE_WALL = 0.30    # distancia mínima de seguridad de las paredes (m) - anula el centrado
+MIN_SAFE_DISTANCE_FRONT = 0.30   # distancia mínima de seguridad del frente (m) - para adelante
+KP_POSITION = 0.4                # ganancia proporcional para el control de posición
+
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7AA')
+
+if len(sys.argv) > 1:
+    URI = sys.argv[1]
+
+# Solo mostrar errores
+logging.basicConfig(level=logging.ERROR)
+
+
+def is_close(range_value):
+    """Comprueba si la distancia está por debajo del umbral mínimo."""
+    if range_value is None:
+        return False
+    return range_value < MIN_DISTANCE_OBSTACLE
+
+
+def setup_logging(scf):
+    """Configura y arranca el LogConfig para stateEstimate.x/y."""
+    state = {'x': None, 'y': None}
+
+    log_conf = LogConfig(name='State', period_in_ms=LOG_PERIOD_MS)
+    log_conf.add_variable('stateEstimate.x', 'float')
+    log_conf.add_variable('stateEstimate.y', 'float')
+
+    def _state_cb(timestamp, data, logconf):
+        state['x'] = data.get('stateEstimate.x', state['x'])
+        state['y'] = data.get('stateEstimate.y', state['y'])
+
+    log_conf.data_received_cb.add_callback(_state_cb)
+    scf.cf.log.add_config(log_conf)
+    try:
+        log_conf.start()
+    except Exception:
+        pass
+
+    return state, log_conf
+
+
+def smooth_distance(current, previous, alpha):
+    """Aplica suavizado exponencial a una medida de distancia."""
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+    return alpha * current + (1 - alpha) * previous
+
+
+def process_multiranger_readings(left, right, last_left, last_right):
+    """Lee, suaviza y mantiene los valores del multiranger."""
+    prev_left = last_left
+    prev_right = last_right
+
+    last_left = smooth_distance(left, last_left, ALPHA)
+    last_right = smooth_distance(right, last_right, ALPHA)
+
+    # Si falta lectura, mantener la anterior
+    if left is None:
+        left = last_left
+    if right is None:
+        right = last_right
+
+    delta_left = None if (prev_left is None or last_left is None) else (last_left - prev_left)
+    delta_right = None if (prev_right is None or last_right is None) else (last_right - prev_right)
+
+    return left, right, last_left, last_right, delta_left, delta_right
+
+
+def calculate_lateral_error(left, right, last_left, last_right):
+    """Calcula el error lateral basado en las distancias a las paredes."""
+    if left is not None and right is not None:
+        error = left - right
+    elif left is not None and right is None and last_right is not None:
+        error = left - last_right
+    elif right is not None and left is None and last_left is not None:
+        error = last_left - right
+    else:
+        error = 0.0
+    return error
+
+
+def calculate_position_maintenance_error(left, right, last_left, last_right):
+    """Mantiene el drone centrado, pero anula con seguridad si está muy cerca de una pared.
+    
+    La estrategia es:
+    1. Normalmente, mantener el error lateral = 0 (centrado entre left y right)
+    2. Si está muy cerca de una pared (< MIN_SAFE_DISTANCE_WALL), generar orden de alejar
+    """
+    current_left = left if left is not None else last_left
+    current_right = right if right is not None else last_right
+    
+    if current_left is None or current_right is None:
+        return 0.0
+    
+    # Comprobar si está muy cerca de alguna pared
+    if current_left < MIN_SAFE_DISTANCE_WALL:
+        # Muy cerca de la pared izquierda: moverse a derecha (error positivo fuerte)
+        return (MIN_SAFE_DISTANCE_WALL - current_left) * 2.0
+    
+    if current_right < MIN_SAFE_DISTANCE_WALL:
+        # Muy cerca de la pared derecha: moverse a izquierda (error negativo fuerte)
+        return -(MIN_SAFE_DISTANCE_WALL - current_right) * 2.0
+    
+    # Si está en zona segura, mantener centrado (error = left - right, idealmente 0)
+    return 0.0
+
+
+def detect_jump(error, last_error, delta_left, delta_right, now, jump_until):
+    """Detecta saltos drásticos en las medidas y activa modo conservador.
+
+    Devuelve kp_local, jump_until, jump_detected(bool), jump_sensor('left'|'right'|None), jump_sign(+1/-1|0)
+    """
+    kp_local = KP
+    jump_detected = False
+    jump_sensor = None
+    jump_sign = 0
+
+    if abs(error - last_error) > JUMP_ERROR_THRESHOLD:
+        left_jump = (delta_left is not None and abs(delta_left) > JUMP_MEASURE_THRESHOLD)
+        right_jump = (delta_right is not None and abs(delta_right) > JUMP_MEASURE_THRESHOLD)
+        if left_jump or right_jump:
+            jump_until = now + JUMP_IGNORE_TIME
+            jump_detected = True
+            # prefer left if both
+            if left_jump:
+                jump_sensor = 'left'
+                jump_sign = 1 if delta_left > 0 else -1
+            else:
+                jump_sensor = 'right'
+                jump_sign = 1 if delta_right > 0 else -1
+            print(f'Jump detected: d_err={error-last_error:.3f}  dL={delta_left}  dR={delta_right}  entering conservative mode')
+
+    # Si estamos en periodo de salto, reducir ganancia
+    if now < jump_until:
+        kp_local = KP * KP_JUMP_SCALE
+
+    return kp_local, jump_until, jump_detected, jump_sensor, jump_sign
+
+
+def compute_lateral_control(error, derivative, kp_local, kd_local):
+    """Calcula la orden de velocidad lateral usando control PD."""
+    velocity_y = 0.0
+
+    if abs(error) > 0.02:
+        velocity_y = (kp_local * error + kd_local * derivative)
+        # Mínimo para vencer inercias
+        if abs(velocity_y) < MIN_LAT_SPEED:
+            velocity_y = MIN_LAT_SPEED * (-1 if velocity_y < 0 else 1)
+
+    # Limitar velocidad máxima
+    if velocity_y > MAX_LAT_VELOCITY:
+        velocity_y = MAX_LAT_VELOCITY
+    elif velocity_y < -MAX_LAT_VELOCITY:
+        velocity_y = -MAX_LAT_VELOCITY
+
+    return velocity_y
+
+
+def update_distances(dt, velocity_x, state, last_state_x, last_state_y, distance_travelled_x, distance_travelled_state):
+    """Actualiza las distancias acumuladas (dead-reckoning y stateEstimate)."""
+    # Dead-reckoning: siempre se acumula
+    if dt > 0:
+        distance_travelled_x += velocity_x * dt
+
+    # stateEstimate: acumular si está disponible
+    if state.get('x') is not None and state.get('y') is not None:
+        if last_state_x is None or last_state_y is None:
+            last_state_x = state['x']
+            last_state_y = state['y']
+        else:
+            dx = state['x'] - last_state_x
+            dy = state['y'] - last_state_y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < 5.0:  # ignorar saltos extraños
+                distance_travelled_state += dist
+            last_state_x = state['x']
+            last_state_y = state['y']
+
+    return distance_travelled_x, distance_travelled_state, last_state_x, last_state_y
+
+
+def print_debug_info(error, velocity_y, distance_travelled_x, distance_travelled_state, state, last_state_x, left, right):
+    """Imprime información de depuración en cada iteración."""
+    print(f'err={error:.3f}  vel_y={velocity_y:.3f}')
+    if POSITION_MAINTENANCE and left is not None and right is not None:
+        print(f'distances: L={left:.2f}m  R={right:.2f}m  [safe_limit={MIN_SAFE_DISTANCE_WALL:.2f}]')
+    print(f'dist_dead={distance_travelled_x:.2f} m  dist_state={distance_travelled_state:.2f} m / target={TARGET_DISTANCE_X:.1f} m')
+    sx = state.get('x')
+    if sx is None:
+        print(f'state_x=None  last_state_x={last_state_x}')
+    else:
+        print(f'state_x={sx:.3f}  last_state_x={last_state_x if last_state_x is None else f"{last_state_x:.3f}"}')
+
+
+if __name__ == '__main__':
+    cflib.crtp.init_drivers()
+
+    cf = Crazyflie(rw_cache='./cache')
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        scf.cf.platform.send_arming_request(True)
+        time.sleep(1.0)
+
+        # Inicializar logging
+        state, log_conf = setup_logging(scf)
+
+        with MotionCommander(scf) as motion_commander:
+            with Multiranger(scf) as multiranger:
+                keep_flying = True
+
+                # Variables de estado del control
+                last_left = None
+                last_right = None
+                last_time = time.time()
+                last_error = 0.0
+                distance_travelled_x = 0.0
+                distance_travelled_state = 0.0
+                last_state_x = None
+                last_state_y = None
+                jump_until = 0.0
+                # waiting_for_recovery: block lateral action until we see the jump reverse
+                waiting_for_recovery = False
+                wait_jump_sensor = None
+                wait_jump_sign = 0
+                last_velocity_y = 0.0
+                last_derivative = 0.0
+
+                while keep_flying:
+                    velocity_x = VELOCITY_X_CRUISE
+                    velocity_y = 0.0
+
+                    # Calcular tiempo transcurrido
+                    now = time.time()
+                    dt = now - last_time if last_time is not None else 0.0
+                    last_time = now
+
+                    # Procesar lecturas del multiranger
+                    left, right, last_left, last_right, delta_left, delta_right = \
+                        process_multiranger_readings(multiranger.left, multiranger.right, last_left, last_right)
+
+                    # Calcular error lateral
+                    error = calculate_lateral_error(left, right, last_left, last_right)
+
+                    # Calcular derivada del error y suavizarla para evitar picos
+                    if dt <= 0:
+                        derivative = 0.0
+                    else:
+                        derivative = (error - last_error) / dt
+                    # elegir alpha de derivada según modo
+                    deriv_alpha = DAMPED_DERIV_ALPHA if DAMPED_MODE else DERIVATIVE_FILTER_ALPHA
+                    # filtro exponencial sobre la derivada
+                    derivative = deriv_alpha * derivative + (1 - deriv_alpha) * last_derivative
+                    last_derivative = derivative
+
+                    # Detectar saltos y ajustar ganancia
+                    kp_local, jump_until, jump_detected, jump_sensor, jump_sign = \
+                        detect_jump(error, last_error, delta_left, delta_right, now, jump_until)
+
+                    # Si detectamos un salto, entrar en espera hasta que veamos la recuperación
+                    if jump_detected:
+                        waiting_for_recovery = True
+                        wait_jump_sensor = jump_sensor
+                        wait_jump_sign = jump_sign
+
+                    # Mantener velocidad de crucero constante durante saltos
+
+                    # Calcular control lateral (pero puede que lo bloqueemos si estamos esperando recuperación)
+                    kd_local = KD * (DAMPED_KD_SCALE if DAMPED_MODE else 1.0)
+                    desired_velocity_y = compute_lateral_control(error, derivative, kp_local, kd_local)
+
+                    # === Control de mantenimiento de posición (opcional) ===
+                    if POSITION_MAINTENANCE:
+                        position_error = calculate_position_maintenance_error(left, right, last_left, last_right)
+                        # Control proporcional simple para mantener posición
+                        position_velocity_y = KP_POSITION * position_error
+                        # Limitar velocidad
+                        if position_velocity_y > MAX_LAT_VELOCITY:
+                            position_velocity_y = MAX_LAT_VELOCITY
+                        elif position_velocity_y < -MAX_LAT_VELOCITY:
+                            position_velocity_y = -MAX_LAT_VELOCITY
+                        
+                        # La función position_maintenance ya maneja centrado + seguridad
+                        # Si hay peligro de choque, devuelve orden fuerte; si no, devuelve 0 (usa deseo de centrado)
+                        if abs(position_error) > 0.05:
+                            # Peligro detectado: activar safety
+                            desired_velocity_y = position_velocity_y
+                        else:
+                            # Normal: usar centrado original
+                            pass
+                    
+                    # === Chequeo de obstáculo al frente ===
+                    if multiranger.front is not None and multiranger.front < MIN_SAFE_DISTANCE_FRONT:
+                        print(f'FRONT OBSTACLE DETECTED ({multiranger.front:.2f}m < {MIN_SAFE_DISTANCE_FRONT:.2f}m): STOPPING')
+                        velocity_x = 0.0
+
+                    # Si estamos esperando la recuperación de un salto, comprobar si ya se invirtió
+                    if waiting_for_recovery:
+                        sensor_delta = delta_left if wait_jump_sensor == 'left' else delta_right
+                        recovered = False
+                        if sensor_delta is not None and (sensor_delta * wait_jump_sign) < -JUMP_MEASURE_THRESHOLD:
+                            recovered = True
+                        if recovered:
+                            waiting_for_recovery = False
+                            wait_jump_sensor = None
+                            wait_jump_sign = 0
+                            print('Recovery detected: resuming lateral control')
+                        else:
+                            # No actuar lateralmente hasta la recuperación
+                            desired_velocity_y = 0.0
+
+                    # Aplicar limitador de tasa (slew-rate) para evitar cambios bruscos
+                    if dt > 0:
+                        max_lat_accel = DAMPED_MAX_LAT_ACCEL if DAMPED_MODE else MAX_LAT_ACCEL
+                        max_delta = max_lat_accel * dt
+                        delta_v = desired_velocity_y - last_velocity_y
+                        if delta_v > max_delta:
+                            velocity_y = last_velocity_y + max_delta
+                        elif delta_v < -max_delta:
+                            velocity_y = last_velocity_y - max_delta
+                        else:
+                            velocity_y = desired_velocity_y
+                    else:
+                        velocity_y = desired_velocity_y
+
+                    # If still waiting and we forced desired_velocity_y to 0, zero the output to avoid acting
+                    if waiting_for_recovery and velocity_y != 0.0:
+                        velocity_y = 0.0
+                        last_velocity_y = 0.0
+                    else:
+                        last_velocity_y = velocity_y
+
+                    last_error = error
+
+                    # Comprobar sensor superior (mano encima)
+                    if is_close(multiranger.up):
+                        print('Hand detected above, stopping demo')
+                        keep_flying = False
+
+                    # Actualizar distancias
+                    distance_travelled_x, distance_travelled_state, last_state_x, last_state_y = \
+                        update_distances(dt, velocity_x, state, last_state_x, last_state_y, distance_travelled_x, distance_travelled_state)
+
+                    # Imprimir información de depuración
+                    print_debug_info(error, velocity_y, distance_travelled_x, distance_travelled_state, state, last_state_x, left, right)
+
+                    # Comprobar si se alcanzó la distancia objetivo
+                    # Priorizar la medida del estimador (`distance_travelled_state`) si hay datos
+                    if distance_travelled_state > 0.0:
+                        if distance_travelled_state >= TARGET_DISTANCE_X:
+                            print(f'Target distance {TARGET_DISTANCE_X} m reached (state), stopping')
+                            keep_flying = False
+                            break
+                    else:
+                        if distance_travelled_x >= TARGET_DISTANCE_X:
+                            print(f'Target distance {TARGET_DISTANCE_X} m reached (dead-reckoning), stopping')
+                            keep_flying = False
+                            break
+
+                    # Enviar órdenes de movimiento
+                    motion_commander.start_linear_motion(velocity_x, velocity_y, 0)
+
+                    time.sleep(0.1)
+
+        # Parar y limpiar el logging
+        try:
+            log_conf.stop()
+            scf.cf.log.remove_config(log_conf)
+        except Exception:
+            pass
+
+        print('Demo terminated!')
+
