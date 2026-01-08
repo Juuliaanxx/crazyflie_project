@@ -238,7 +238,7 @@ def update_distances(dt, velocity_x, state, last_state_x, last_state_y, distance
 
 def print_debug_info(error, velocity_y, distance_travelled_x, distance_travelled_state, state, last_state_x, left, right):
     """Imprime información de depuración en cada iteración."""
-    print(f'err={error:.3f}  vel_y={velocity_y:.3f}')
+    print(f'err={error:.3f}  vel_y={velocity_y:.3f} vel_x={VELOCITY_X_CRUISE:.3f}')
     if POSITION_MAINTENANCE and left is not None and right is not None:
         print(f'distances: L={left:.2f}m  R={right:.2f}m  [safe_limit={MIN_SAFE_DISTANCE_WALL:.2f}]')
     print(f'dist_dead={distance_travelled_x:.2f} m  dist_state={distance_travelled_state:.2f} m / target={TARGET_DISTANCE_X:.1f} m')
