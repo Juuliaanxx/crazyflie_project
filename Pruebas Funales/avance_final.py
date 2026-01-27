@@ -32,7 +32,7 @@ from cflib.crazyflie.log import LogConfig
 # Parámetros principales
 # =====================
 
-# --- Control lateral (centrado L/R) ---
+# Control lateral (centrado L/R)
 KP = 0.3
 KD = 0.2
 ALPHA = 0.6                 # suavizado exponencial para medidas L/R
@@ -42,8 +42,8 @@ DERIVATIVE_FILTER_ALPHA = 0.6
 MAX_LAT_ACCEL = 1.0         # limitador de aceleración lateral (m/s^2)
 
 # --- Avance recto ---
-VELOCITY_X_CRUISE = 0.05    # m/s
-TARGET_DISTANCE_X = 10.0    # m (si stateEstimate.x está disponible, se usa dist en el plano)
+VELOCITY_X_CRUISE = 0.075 #0.05    # m/s
+TARGET_DISTANCE_X = 5.0 # 10.0    # m (si stateEstimate.x está disponible, se usa dist en el plano)
 
 # --- Logging del estimador (para parar por distancia) ---
 LOG_PERIOD_MS = 50
@@ -51,7 +51,7 @@ LOG_PERIOD_MS = 50
 # --- Detección de saltos (pasillos abiertos/cambios bruscos) ---
 JUMP_ERROR_THRESHOLD = 0.5
 JUMP_MEASURE_THRESHOLD = 0.5
-JUMP_IGNORE_TIME = 1.0
+JUMP_IGNORE_TIME = 2.0#1.0
 KP_JUMP_SCALE = 0.2
 SLOW_VX_IN_JUMP = 0.02
 
