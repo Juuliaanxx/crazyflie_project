@@ -51,7 +51,7 @@ LOG_PERIOD_MS = 50
 # --- Detección de saltos (pasillos abiertos/cambios bruscos) ---
 JUMP_ERROR_THRESHOLD = 0.5
 JUMP_MEASURE_THRESHOLD = 0.5
-JUMP_IGNORE_TIME = 2.0#1.0
+JUMP_IGNORE_TIME = 2.0 #1.0
 KP_JUMP_SCALE = 0.2
 SLOW_VX_IN_JUMP = 0.02
 
@@ -268,6 +268,8 @@ def update_distances(dt, velocity_x, state, last_state_x, last_state_y, dist_dea
             dx = state['x'] - last_state_x
             dy = state['y'] - last_state_y
             dist = math.sqrt(dx * dx + dy * dy)
+            
+            #dist = dx
             if dist < 5.0:
                 dist_state += dist
             last_state_x = state['x']
